@@ -2522,6 +2522,41 @@ t('Custom socket', {}, async() => {
   ]
 })
 
+t('Connection end cancels a pending socket factory', async() => {
+  const net = await import('node:net')
+  let release
+    , started
+    , closes = 0
+
+  const connecting = new Promise(r => started = r)
+      , socket = new net.Socket()
+      , application_name = 'postgres.js end socket factory ' + crypto.randomBytes(4).toString('hex')
+      , client = postgres({
+        ...options,
+        connection: { application_name },
+        onclose: () => closes++,
+        socket: ({ port, host }) => new Promise((resolve, reject) => {
+          release = resolve
+          socket.on('error', reject)
+          socket.connect(port[0], host[0], started)
+        })
+      })
+      , query = client`select 1`.catch(x => x.code)
+
+  try {
+    await connecting
+    await client.end({ timeout: 0 })
+    release(socket)
+    await delay(200)
+    const [{ count }] = await sql`select count(*)::int as count from pg_stat_activity where application_name = ${ application_name }`
+    return ['CONNECTION_DESTROYED,0,true,0', [await query, count, socket.destroyed, closes].join()]
+  } finally {
+    socket.destroy()
+    await client.end({ timeout: 0 })
+    await sql`select pg_terminate_backend(pid) from pg_stat_activity where application_name = ${ application_name }`
+  }
+})
+
 t('Ensure drain only dequeues if ready', async() => {
   const sql = postgres(options)
 
@@ -2718,4 +2753,47 @@ t('query during copy error', async() => {
     'COPY_IN_PROGRESS', error.code,
     await sql`drop table test`
   ]
+})
+
+t('Connection end cancels a pending listen reconnect', async() => {
+  let closed
+    , listens = 0
+
+  const disconnected = new Promise(r => closed = r)
+      , application_name = 'postgres.js end reconnect ' + crypto.randomBytes(4).toString('hex')
+      , client = postgres({
+        ...options,
+        backoff: () => (closed(), 0.2),
+        connection: { application_name }
+      })
+
+  try {
+    const { state: { pid } } = await client.listen('end_reconnect', () => 0, () => listens++)
+    await sql`select pg_terminate_backend(${ pid })`
+    await disconnected
+    await delay(0)
+    const before = listens
+    await client.end()
+    await delay(400)
+    const [{ count }] = await sql`select count(*)::int as count from pg_stat_activity where application_name = ${ application_name }`
+    return ['1,1,0', [before, listens, count].join()]
+  } finally {
+    await client.end({ timeout: 0 })
+    await sql`select pg_terminate_backend(pid) from pg_stat_activity where application_name = ${ application_name }`
+  }
+})
+
+t('Connection end cancels the first listen attempt', async() => {
+  // Use native sockets because Deno's net shim has different connection states.
+  const net = await import('node:net')
+  const server = net.createServer(socket => socket.resume())
+  server.listen()
+  const socket = new net.Socket()
+  const closed = new Promise(r => socket.once('close', r))
+  const sql = postgres({ ...options, connect_timeout: 30, socket: () => socket.connect(server.address().port, '127.0.0.1') })
+  const listening = sql.listen('end_connecting', () => {}).catch(x => x.code)
+  await sql.end()
+  await closed
+  server.close()
+  return ['CONNECTION_DESTROYED', await listening]
 })
